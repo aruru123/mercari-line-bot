@@ -62,7 +62,7 @@ def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
     商品画像を Gemini Vision で解析し、出品情報を dict で返す。
     失敗時もフォールバック dict を返す（None は返さない）。
     """
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
     for model in models:
         try:
