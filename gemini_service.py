@@ -20,7 +20,14 @@ def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
         from PIL import Image
 
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # 新しいモデル名を試す（古いモデルは廃止される場合あり）
+        model_name = "gemini-2.0-flash"
+        try:
+            model = genai.GenerativeModel(model_name)
+        except Exception:
+            model_name = "gemini-1.5-flash"
+            model = genai.GenerativeModel(model_name)
+        logger.info(f"Using Gemini model: {model_name}")
         image = Image.open(BytesIO(image_bytes))
 
         prompt = """この商品画像を分析して、メルカリへの出品に必要な情報を
@@ -47,10 +54,19 @@ def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
         return product_info
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}\nRaw: {text[:200]}")
-        return None
+        logger.error(f"JSON parse error: {e}\nRaw: {text[:500]}")
+        # JSON解析失敗の場合でも基本情報を返す
+        return {
+            "name": "商品",
+            "description": "（自動解析失敗のため手動入力が必要です）",
+            "condition": "目立った傷や汚れなし",
+            "price": 1000,
+            "brand": "",
+            "color": "",
+            "size": ""
+        }
     except Exception as e:
-        logger.error(f"Gemini error: {e}", exc_info=True)
+        logger.error(f"Gemini error: {type(e).__name__}: {e}", exc_info=True)
         return None
 
 
@@ -69,4 +85,4 @@ def get_condition_id(condition_text: str) -> int:
     for key, val in CONDITION_MAP.items():
         if key in condition_text:
             return val
-    return 3  # デフォ・ト：目立った傷や汚れなし
+    return 3  # デフォルト：目立った傷や汚れなし
