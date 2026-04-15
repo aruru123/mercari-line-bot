@@ -1,6 +1,6 @@
 """
 Gemini Vision API で商品画像を解析し、メルカリ出品情報を返す
-REST API を直接使用（SDK バージョン問題を回避）
+複数画像を1リクエストでまとめて解析対応
 """
 
 import json
@@ -8,11 +8,13 @@ import re
 import base64
 import logging
 import requests as http_requests
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
-PROMPT = """この商品画像を分析して、メルカリへの出品に必要な情報を
+PROMPT = """これらの商品画像を分析して、メルカリへの出品に必要な情報を
 以下の JSON 形式で返してください。JSON のみ返し、他のテキストは不要です。
+複数枚の写真がある場合は、すべての写真を参考にして詳細な情報を作成してください。
 
 {
   "name": "商品名（ブランド名＋種別＋特徴を含む具体的な名前、40文字以内）",
@@ -26,49 +28,69 @@ PROMPT = """この商品画像を分析して、メルカリへの出品に必�
 
 MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
+MAX_IMAGE_KB = 3000  # これ以上は圧縮
 
-def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
+
+def _compress_image(image_bytes: bytes, max_kb: int = MAX_IMAGE_KB) -> bytes:
+    """画像が大きすぎる場合はリサイズして返す"""
+    if len(image_bytes) // 1024 <= max_kb:
+        return image_bytes
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(image_bytes))
+        img.thumbnail((1920, 1920))
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        compressed = buf.getvalue()
+        logger.info(f"画像圧縮: {len(image_bytes)//1024}KB → {len(compressed)//1024}KB")
+        return compressed
+    except Exception as e:
+        logger.warning(f"画像圧縮失敗: {e}")
+        return image_bytes
+
+
+def analyze_product_images(images_bytes_list: list, api_key: str) -> dict | None:
     """
-    商品画像を Gemini Vision で解析し、出品情報を dict で返す。
+    複数の商品画像を Gemini Vision で解析し、出品情報を dict で返す。
+    すべての画像を1つのリクエストに含めて送信する。
     失敗時もフォールバック dict を返す。
     """
-    img_size_kb = len(image_bytes) // 1024
-    logger.info(f"Image size: {img_size_kb} KB")
+    if not images_bytes_list:
+        return None
 
-    # 画像が大きすぎる場合はリサイズ
-    if img_size_kb > 3000:
-        try:
-            from PIL import Image
-            from io import BytesIO
-            img = Image.open(BytesIO(image_bytes))
-            img.thumbnail((1920, 1920))
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            image_bytes = buf.getvalue()
-            img_size_kb = len(image_bytes) // 1024
-            logger.info(f"Resized to: {img_size_kb} KB")
-        except Exception as e:
-            logger.warning(f"Resize failed: {e}")
+    n = len(images_bytes_list)
+    logger.info(f"Gemini解析: {n}枚の画像")
 
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    # 画像を圧縮してbase64エンコード
+    encoded_images = []
+    for i, img_bytes in enumerate(images_bytes_list):
+        compressed = _compress_image(img_bytes)
+        logger.info(f"  画像{i+1}: {len(compressed)//1024}KB")
+        encoded_images.append(base64.b64encode(compressed).decode())
+
     errors = []
-
     for model in MODELS:
         try:
-            logger.info(f"Trying: {model}")
             url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models"
-                f"/{model}:generateContent?key={api_key}"
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
             )
+
+            # プロンプト + 全画像をpartsに含める
+            parts = [{"text": PROMPT}]
+            for b64_data in encoded_images:
+                parts.append({
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": b64_data,
+                    }
+                })
+
             payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": PROMPT},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
-                    ]
-                }],
+                "contents": [{"parts": parts}],
                 "generationConfig": {"temperature": 0.1},
             }
+
             resp = http_requests.post(url, json=payload, timeout=90)
             logger.info(f"HTTP {resp.status_code} from {model}")
 
@@ -92,37 +114,33 @@ def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
         except json.JSONDecodeError as e:
             logger.error(f"JSON error ({model}): {e}")
             return {
-                "name": "商品（解析部分失敗）",
-                "description": f"テキスト取得済みだがJSON変換失敗: {text[:200]}",
+                "name": "商品",
+                "description": f"[DEBUG] {n}枚画像 / JSONエラー: {e}",
                 "condition": "目立った傷や汚れなし",
                 "price": 1000,
-                "brand": "", "color": "", "size": "",
+                "brand": "",
+                "color": "",
+                "size": "",
             }
         except Exception as e:
-            err = f"{model}→{type(e).__name__}:{str(e)[:80]}"
+            err = f"{model}→{type(e).__name__}"
             errors.append(err)
-            logger.error(f"Error: {err}")
+            logger.error(f"{err}: {e}")
             continue
 
     # 全モデル失敗
-    err_summary = " / ".join(errors) if errors else "不明"
-    logger.error(f"All models failed: {err_summary}")
+    logger.error(f"全モデル失敗: {errors}")
     return {
         "name": "商品",
-        "description": f"[DEBUG] 画像{img_size_kb}KB / エラー: {err_summary[:200]}",
+        "description": f"[DEBUG] {n}枚 / エラー: {' / '.join(errors)}",
         "condition": "目立った傷や汚れなし",
         "price": 1000,
-        "brand": "", "color": "", "size": "",
+        "brand": "",
+        "color": "",
+        "size": "",
     }
 
 
-CONDITION_MAP = {
-    "新品未使用": 1, "未使用に近い": 2, "目立った傷や汚れなし": 3,
-    "やや傷や汚れあり": 4, "傷や汚れあり": 5, "全体的に状態が悪い": 6,
-}
-
-def get_condition_id(condition_text: str) -> int:
-    for key, val in CONDITION_MAP.items():
-        if key in condition_text:
-            return val
-    return 3
+# 後方互换のためのラッパー
+def analyze_product_image(image_bytes: bytes, api_key: str) -> dict | None:
+    return analyze_product_images([image_bytes], api_key)
