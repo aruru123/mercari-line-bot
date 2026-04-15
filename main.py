@@ -1,5 +1,6 @@
 """
 LINE → Gemini → メルカリ 自動下書き作成サーバー
+複数写真の同時送信を1つの下書きにまとめるバッチ処理対応
 """
 
 import os
@@ -10,6 +11,7 @@ import hmac
 import hashlib
 import base64
 import requests
+from collections import defaultdict
 from flask import Flask, request, abort
 
 logging.basicConfig(
@@ -21,10 +23,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ── 環境変数 ────────────────────────────────────────────
-LINE_ACCESS_TOKEN  = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_ACCESS_TOKEN   = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
-MERCARI_COOKIES    = os.environ.get("MERCARI_COOKIES", "[]")   # JSON配列
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+MERCARI_COOKIES     = os.environ.get("MERCARI_COOKIES", "[]")
+
+# ── 画像バッファ（バッチ処理） ────────────────────────────
+BATCH_WINDOW = 5  # 最後の写真から何秒待つか
+_buffers: dict = defaultdict(list)   # user_id → [image_bytes, ...]
+_timers:  dict = {}                   # user_id → threading.Timer
+_lock = threading.Lock()
 
 
 # ── LINE ヘルパー ──────────────────────────────────────────
@@ -37,19 +45,6 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(base64.b64encode(digest).decode(), signature)
 
 
-def reply_message(reply_token: str, text: str):
-    requests.post(
-        "https://api.line.me/v2/bot/message/reply",
-        headers={
-            "Authorization": f"Bearer {LINE_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"replyToken": reply_token,
-              "messages": [{"type": "text", "text": text}]},
-        timeout=10,
-    )
-
-
 def push_message(user_id: str, text: str):
     requests.post(
         "https://api.line.me/v2/bot/message/push",
@@ -57,8 +52,7 @@ def push_message(user_id: str, text: str):
             "Authorization": f"Bearer {LINE_ACCESS_TOKEN}",
             "Content-Type": "application/json",
         },
-        json={"to": user_id,
-              "messages": [{"type": "text", "text": text}]},
+        json={"to": user_id, "messages": [{"type": "text", "text": text}]},
         timeout=10,
     )
 
@@ -73,38 +67,87 @@ def download_image(message_id: str) -> bytes:
     return resp.content
 
 
-# ── バックグラウンド処理 ────────────────────────────────────────────
-def process_image(message_id: str, user_id: str):
-    from gemini_service import analyze_product_image
+# ── バッチ処理 ────────────────────────────────────────────
+def _fire_batch(user_id: str):
+    """タイマー発火時: バッファの全画像をまとめて処理する"""
+    with _lock:
+        images = _buffers.pop(user_id, [])
+        _timers.pop(user_id, None)
+
+    if not images:
+        return
+
+    logger.info(f"バッチ処理開始: user={user_id}, {len(images)}枚")
+    threading.Thread(
+        target=process_images,
+        args=(images, user_id),
+        daemon=True,
+    ).start()
+
+
+def add_image_to_batch(message_id: str, user_id: str):
+    """画像1枚をダウンロードしてバッファに追加、タイマーをリセット"""
+    try:
+        logger.info(f"画像ダウンロード中: {message_id}")
+        image_bytes = download_image(message_id)
+        logger.info(f"ダウンロード完了: {len(image_bytes)//1024}KB")
+    except Exception as e:
+        logger.error(f"画像ダウンロード失敗: {e}")
+        push_message(user_id, f"❌ 画像のダウンロードに失敗しました: {e}")
+        return
+
+    with _lock:
+        _buffers[user_id].append(image_bytes)
+        count = len(_buffers[user_id])
+
+        # 既存タイマーをキャンセルして新しくセット
+        if user_id in _timers:
+            _timers[user_id].cancel()
+        t = threading.Timer(BATCH_WINDOW, _fire_batch, args=[user_id])
+        t.daemon = True
+        _timers[user_id] = t
+        t.start()
+
+    logger.info(f"バッファ: user={user_id} 計{count}枚 ({BATCH_WINDOW}秒後に処理)")
+
+    # 1枚目受信時のみ通知
+    if count == 1:
+        push_message(
+            user_id,
+            f"📸 写真を受け取りました。\n"
+            f"複数枚ある場合は {BATCH_WINDOW} 秒以内に送ってください。\n"
+            f"まとめて1つの下書きを作成します✨"
+        )
+
+
+# ── メイン処理 ────────────────────────────────────────────
+def process_images(images: list, user_id: str):
+    """複数画像をまとめてGemini解析 → メルカリ下書き作成"""
+    from gemini_service import analyze_product_images
     from mercari_service import create_mercari_draft
 
     try:
-        # 1. 画像ダウンロード
-        logger.info(f"Downloading image {message_id}")
-        image_bytes = download_image(message_id)
+        n = len(images)
+        logger.info(f"Gemini解析開始: {n}枚")
+        product_info = analyze_product_images(images, GEMINI_API_KEY)
 
-        # 2. Gemini で商品情報を解析
-        logger.info("Analyzing with Gemini Vision...")
-        product_info = analyze_product_image(image_bytes, GEMINI_API_KEY)
         if not product_info:
-            push_message(user_id, "❌ 商品情報の解析に失敗しました。")
+            push_message(user_id, "❌ 商品情報の解析に失敗しました")
             return
 
-        logger.info(f"Product info: {product_info.get('name')}")
-
-        # 3. メルカリ下書きを作成
-        logger.info("Creating Mercari draft...")
-        draft_url = create_mercari_draft(product_info, image_bytes, MERCARI_COOKIES)
-
-        # 4. 結果を LINE で通知
-        name  = product_info.get("name", "")
+        name  = product_info.get("name", "商品")
         price = product_info.get("price", 0)
         cond  = product_info.get("condition", "")
         desc  = product_info.get("description", "")
+        logger.info(f"商品情報: {name} / ¥{price}")
 
-        if draft_url:
+        # メルカリ下書き作成（全画像を渡す）
+        draft_ok = create_mercari_draft(product_info, images, MERCARI_COOKIES)
+
+        if draft_ok:
             msg = (
                 f"✅ メルカリ下書きを作成しました！\n\n"
+                f"📸 写真：{n}枚\n"
                 f"商品名：{name}\n"
                 f"価格：¥{price:,}\n"
                 f"状態：{cond}\n\n"
@@ -131,52 +174,37 @@ def process_image(message_id: str, user_id: str):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data()
+    body_bytes = request.get_data()
 
-    if not verify_signature(body, signature):
-        logger.warning("Invalid signature")
+    if not verify_signature(body_bytes, signature):
         abort(400)
 
-    events = json.loads(body).get("events", [])
+    body = json.loads(body_bytes.decode("utf-8"))
 
-    for event in events:
-        if (event.get("type") == "message"
-                and event.get("message", {}).get("type") == "image"):
+    for event in body.get("events", []):
+        if event.get("type") != "message":
+            continue
+        msg = event.get("message", {})
+        if msg.get("type") != "image":
+            continue
 
-            message_id  = event["message"]["id"]
-            user_id     = event["source"]["userId"]
-            reply_token = event.get("replyToken", "")
+        message_id = msg["id"]
+        user_id    = event["source"]["userId"]
 
-            # すぐに受付確認を返す（reply token は 30 秒で失效）
-            reply_message(
-                reply_token,
-                "📸 画像を受け取りました！\n"
-                "商品情報を解析してメルカリ下書きを作成中です...\n"
-                "（通常 30～60 秒かかります）"
-            )
-
-            # バックグラウンドで処理
-            t = threading.Thread(
-                target=process_image,
-                args=(message_id, user_id),
-                daemon=True,
-            )
-            t.start()
+        # バックグラウンドで画像をダウンロード & バッファに追加
+        threading.Thread(
+            target=add_image_to_batch,
+            args=(message_id, user_id),
+            daemon=True,
+        ).start()
 
     return "OK", 200
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/", methods=["GET"])
 def health():
-    cookies_ok = MERCARI_COOKIES not in ("[]", "", None)
-    return json.dumps({
-        "status": "ok",
-        "gemini_key": bool(GEMINI_API_KEY),
-        "line_token": bool(LINE_ACCESS_TOKEN),
-        "mercari_cookies": cookies_ok,
-    }), 200
+    return "LINE→メルカリ bot running", 200
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
