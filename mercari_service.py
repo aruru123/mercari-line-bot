@@ -1,6 +1,7 @@
 """
 Mercari 自動下書き作成サービス
 Playwright (Chromium headless) で出品フォームを操作して下書き保存する
+複数画像対応版
 """
 import json
 import logging
@@ -15,53 +16,57 @@ logger = logging.getLogger(__name__)
 
 def create_mercari_draft(
     product_info: dict,
-    image_bytes: bytes | None = None,
+    images_bytes: list | None = None,
     cookies_json: str | None = None,
 ) -> bool:
     """
     メルカリに商品の下書きを作成する。
 
     Args:
-        product_info: Gemini が返す商品情報 dict
-        image_bytes:  商品画像のバイト列（任意）
-        cookies_json: MERCARI_COOKIES 環境変数の値（任意、省略時は env から取得）
+        product_info:  Gemini が返す商品情報 dict
+        images_bytes:  商品画像のバイト列リスト（複数枚対応）
+        cookies_json:  MERCARI_COOKIES 環境変数の値
 
     Returns:
         True = 下書き保存成功 / False = 失敗
     """
+    # 後方互换: bytes が渡された場合もリストに変換
+    if isinstance(images_bytes, bytes):
+        images_bytes = [images_bytes]
+    if images_bytes is None:
+        images_bytes = []
+
     raw_cookies = cookies_json or os.environ.get("MERCARI_COOKIES", "")
     if not raw_cookies:
         logger.error("MERCARI_COOKIES が設定されていません")
         return False
 
-    # --- クッキーのパース ---
     cookies = _parse_cookies(raw_cookies)
     if not cookies:
-        logger.error("クッキーのパースに失敗しました。フォーマットを確認してください。")
+        logger.error("クッキーのパースに失敗しました")
         return False
     logger.info(f"クッキー {len(cookies)} 個を読み込みました")
 
-    # --- 画像ファイルの一時保存 ---
-    tmp_image_path = None
-    if image_bytes:
+    # 全画像を一時ファイルに保存
+    tmp_paths = []
+    for i, img_bytes in enumerate(images_bytes):
         try:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                f.write(image_bytes)
-                tmp_image_path = f.name
-            logger.info(f"画像を一時ファイルに保存: {tmp_image_path} ({len(image_bytes)//1024}KB)")
+                f.write(img_bytes)
+                tmp_paths.append(f.name)
+            logger.info(f"画像{i+1}を一時ファイルに保存: {tmp_paths[-1]} ({len(img_bytes)//1024}KB)")
         except Exception as e:
-            logger.warning(f"画像の一時保存に失敗: {e}")
-            tmp_image_path = None
+            logger.warning(f"画像{i+1}の一時保存に失敗: {e}")
 
     saved = False
     try:
-        saved = _run_playwright(product_info, cookies, tmp_image_path)
+        saved = _run_playwright(product_info, cookies, tmp_paths)
     except Exception as e:
         logger.error(f"Playwright 実行中に予期しないエラー: {e}\n{traceback.format_exc()}")
     finally:
-        if tmp_image_path:
+        for p in tmp_paths:
             try:
-                os.unlink(tmp_image_path)
+                os.unlink(p)
             except Exception:
                 pass
 
@@ -72,10 +77,9 @@ def create_mercari_draft(
 # 内部関数
 # ---------------------------------------------------------------------------
 
-def _parse_cookies(raw: str) -> list[dict]:
-    """JSON 配列 または Netscape/curl 形式のクッキー文字列をパースする"""
+def _parse_cookies(raw: str) -> list:
+    """JSON 配列 または name=value; 形式のクッキー文字列をパースする"""
     raw = raw.strip()
-    # JSON 配列形式
     if raw.startswith("["):
         try:
             data = json.loads(raw)
@@ -84,11 +88,11 @@ def _parse_cookies(raw: str) -> list[dict]:
                 if not isinstance(c, dict):
                     continue
                 cookie = {
-                    "name": str(c.get("name", "")),
-                    "value": str(c.get("value", "")),
-                    "domain": c.get("domain", ".jp.mercari.com"),
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", True),
+                    "name":     str(c.get("name", "")),
+                    "value":    str(c.get("value", "")),
+                    "domain":   c.get("domain", ".jp.mercari.com"),
+                    "path":     c.get("path", "/"),
+                    "secure":   c.get("secure", True),
                     "httpOnly": c.get("httpOnly", False),
                 }
                 if cookie["name"] and cookie["value"]:
@@ -98,7 +102,6 @@ def _parse_cookies(raw: str) -> list[dict]:
             logger.error(f"JSON パースエラー: {e}")
             return []
 
-    # "name=value; name2=value2" 形式
     result = []
     for part in raw.split(";"):
         part = part.strip()
@@ -106,17 +109,17 @@ def _parse_cookies(raw: str) -> list[dict]:
             continue
         name, _, value = part.partition("=")
         result.append({
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": ".jp.mercari.com",
-            "path": "/",
-            "secure": True,
+            "name":     name.strip(),
+            "value":    value.strip(),
+            "domain":   ".jp.mercari.com",
+            "path":     "/",
+            "secure":   True,
             "httpOnly": False,
         })
     return result
 
 
-def _run_playwright(product_info: dict, cookies: list[dict], image_path: str | None) -> bool:
+def _run_playwright(product_info: dict, cookies: list, image_paths: list) -> bool:
     """Playwright を使ってメルカリ出品フォームを操作する"""
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -144,7 +147,6 @@ def _run_playwright(product_info: dict, cookies: list[dict], image_path: str | N
                 logger.info("クッキーをセットしました")
             except Exception as e:
                 logger.error(f"クッキーのセットに失敗: {e}")
-                # 続行してみる（クッキーなしでログインチェックで落とす）
 
             page = context.new_page()
 
@@ -164,33 +166,40 @@ def _run_playwright(product_info: dict, cookies: list[dict], image_path: str | N
             current_url = page.url
             logger.info(f"ナビゲーション後のURL: {current_url}")
             if "login" in current_url.lower() or "signin" in current_url.lower():
-                logger.error(
-                    f"ログインページにリダイレクトされました: {current_url}\n"
-                    "→ MERCARI_COOKIES が期限切れの可能性があります。クッキーを更新してください。"
-                )
+                logger.error(f"ログインページにリダイレクト: {current_url}")
                 return False
 
+            # ---- ログイン状態チェック（ヘッダーボタンで確認） ----
             page.wait_for_timeout(3_000)
+            try:
+                buttons = page.locator("button").all()
+                btn_texts = [b.text_content() for b in buttons[:30] if b.is_visible()]
+                logger.info(f"ページ上のボタン: {btn_texts}")
+                if "ログイン" in btn_texts and "出品する" not in str(btn_texts):
+                    logger.error("ログインされていない状態です。クッキーを更新してください。")
+                    return False
+            except Exception:
+                pass
 
-            # ---- 画像アップロード ----
-            if image_path:
-                logger.info("画像をアップロード中...")
+            # ---- 画像アップロード（複数枚対応） ----
+            if image_paths:
+                logger.info(f"{len(image_paths)}枚の画像をアップロード中...")
                 try:
-                    # ファイル入力を探す
                     file_input = page.locator("input[type='file']").first
-                    file_input.set_input_files(image_path, timeout=15_000)
+                    # Playwrightは複数ファイルを一度にセットできる
+                    file_input.set_input_files(image_paths, timeout=20_000)
                     page.wait_for_timeout(3_000)
-                    logger.info("画像アップロード完了")
+                    logger.info(f"画像アップロード完了: {len(image_paths)}枚")
                 except PWTimeout:
-                    logger.warning("画像アップロードがタイムアウトしました（続行）")
+                    logger.warning("画像アップロードがタイムアウト（続行）")
                 except Exception as e:
                     logger.warning(f"画像アップロードエラー（続行）: {e}")
 
             # ---- 各フィールド入力 ----
-            title = product_info.get("name", "商品")
+            title       = product_info.get("name", "商品")
             description = product_info.get("description", "")
-            price = str(product_info.get("price", 1000))
-            condition = product_info.get("condition", "")
+            price       = str(product_info.get("price", 1000))
+            condition   = product_info.get("condition", "")
 
             logger.info(f"タイトル: {title}")
             logger.info(f"価格: {price}")
@@ -242,7 +251,7 @@ def _fill_field(page, field_type: str, value: str):
             if el.is_visible(timeout=3_000):
                 el.click()
                 el.fill(value)
-                logger.info(f"{field_type} フィールド ({sel}) に入力完了")
+                logger.info(f"{field_type} ({sel}) に入力完了")
                 return
         except Exception:
             continue
@@ -278,21 +287,18 @@ def _fill_price(page, price: str):
 def _select_condition(page, condition: str):
     """商品の状態を選択する"""
     condition_map = {
-        "新品": ["新品、未使用", "新品未使用"],
+        "新品":  ["新品、未使用", "新品未使用"],
         "未使用": ["新品、未使用", "新品未使用", "未使用に近い"],
-        "良好": ["未使用に近い", "目立った傷や汚れなし"],
-        "普通": ["やや傷や汚れあり"],
-        "悪い": ["傷や汚れあり", "全体的に状態が悪い"],
+        "良好":  ["未使用に近い", "目立った傷や汚れなし"],
+        "普通":  ["やや傷や汚れあり"],
+        "悪い":  ["傷や汚れあり", "全体的に状態が悪い"],
     }
 
     try:
-        # 状態選択ボタンを探す
         cond_btn = page.locator("button:has-text('商品の状態'), [data-testid='condition']").first
         if cond_btn.is_visible(timeout=3_000):
             cond_btn.click()
             page.wait_for_timeout(1_000)
-
-            # マッピングでボタンを選ぶ
             labels = condition_map.get(condition, [condition])
             for label in labels:
                 btn = page.locator(f"text='{label}'").first
@@ -324,23 +330,19 @@ def _click_draft_button(page) -> bool:
                 logger.info(f"下書きボタン「{text}」をクリック")
                 page.wait_for_timeout(3_000)
 
-                # 成功確認: URL 変化やトーストメッセージ
                 new_url = page.url
                 logger.info(f"クリック後のURL: {new_url}")
                 if "draft" in new_url or "mypage" in new_url or "complete" in new_url:
                     return True
 
-                # トースト/アラートメッセージで確認
                 toast = page.locator("text='保存しました', text='下書きに保存'").first
                 if toast.is_visible(timeout=3_000):
                     return True
 
-                # URL が変わらなくてもボタンクリック自体は成功とみなす
                 return True
         except Exception:
             continue
 
-    # aria-label でも探す
     try:
         btn = page.locator("[aria-label*='下書き'], [aria-label*='draft']").first
         if btn.is_visible(timeout=3_000):
@@ -353,7 +355,6 @@ def _click_draft_button(page) -> bool:
     logger.error("下書き保存ボタンが見つかりませんでした")
     logger.info(f"現在のURL: {page.url}")
 
-    # デバッグ用: 現在ページのボタン一覧をログ出力
     try:
         buttons = page.locator("button").all()
         btn_texts = [b.text_content() for b in buttons[:20] if b.is_visible()]
