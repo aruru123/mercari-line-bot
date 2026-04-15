@@ -1,14 +1,21 @@
 """
 Mercari 自動下書き作成サービス
-Playwright (Chromium headless) で出品フォームを操作して下書き保存する
-メール/パスワードログイン対応版（クッキー不要）
+Playwright (Chromium headless) + playwright-stealth でbot検知を回避してログイン・下書き保存する
 """
 import logging
 import os
 import tempfile
 import traceback
+import time
+import random
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,7 @@ def create_mercari_draft(
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                 f.write(img_bytes)
                 tmp_paths.append(f.name)
-            logger.info(f"画像{i+1}を一時ファイルに保存: {len(img_bytes)//1024}KB")
+            logger.info(f"画像{i+1}を一時ファイルに保存: {tmp_paths[-1]} ({len(img_bytes)//1024}KB)")
         except Exception as e:
             logger.warning(f"画像{i+1}の一時保存に失敗: {e}")
 
@@ -44,7 +51,7 @@ def create_mercari_draft(
     try:
         saved = _run_playwright(product_info, email, password, tmp_paths)
     except Exception as e:
-        logger.error(f"Playwright実行エラー: {e}\n{traceback.format_exc()}")
+        logger.error(f"Playwright 実行中に予期しないエラー: {e}\n{traceback.format_exc()}")
     finally:
         for p in tmp_paths:
             try:
@@ -55,6 +62,10 @@ def create_mercari_draft(
     return saved
 
 
+def _human_delay(min_ms=500, max_ms=1500):
+    time.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
+
+
 def _run_playwright(product_info: dict, email: str, password: str, image_paths: list) -> bool:
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -63,20 +74,40 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--lang=ja-JP",
             ],
         )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
             locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            extra_http_headers={
+                "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
         )
+
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en-US', 'en'] });
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+        """)
 
         try:
             page = context.new_page()
+
+            if HAS_STEALTH:
+                stealth_sync(page)
+                logger.info("playwright-stealth適用済み")
+            else:
+                logger.warning("playwright-stealth未インストール（bot検知リスクあり）")
 
             if not _login(page, email, password):
                 logger.error("ログインに失敗しました")
@@ -84,20 +115,28 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
 
             logger.info("ログイン成功 → 出品ページへ")
             try:
-                page.goto("https://jp.mercari.com/sell", wait_until="domcontentloaded", timeout=40_000)
+                page.goto(
+                    "https://jp.mercari.com/sell",
+                    wait_until="domcontentloaded",
+                    timeout=40_000,
+                )
+                page.wait_for_load_state("networkidle", timeout=20_000)
             except PWTimeout:
-                logger.error("出品ページタイムアウト")
+                logger.error("タイムアウト: 出品ページの読み込みに失敗")
                 return False
 
-            page.wait_for_timeout(3_000)
+            _human_delay(2000, 4000)
             logger.info(f"出品ページURL: {page.url}")
 
             if image_paths:
+                logger.info(f"{len(image_paths)}枚の画像をアップロード中...")
                 try:
                     file_input = page.locator("input[type='file']").first
                     file_input.set_input_files(image_paths, timeout=20_000)
-                    page.wait_for_timeout(4_000)
-                    logger.info(f"画像{len(image_paths)}枚アップロード完了")
+                    _human_delay(3000, 5000)
+                    logger.info(f"画像アップロード完了: {len(image_paths)}枚")
+                except PWTimeout:
+                    logger.warning("画像アップロードがタイムアウト（続行）")
                 except Exception as e:
                     logger.warning(f"画像アップロードエラー（続行）: {e}")
 
@@ -105,6 +144,8 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             description = product_info.get("description", "")
             price       = str(product_info.get("price", 1000))
             condition   = product_info.get("condition", "")
+
+            logger.info(f"タイトル: {title} / 価格: {price}")
 
             _fill_field(page, "title", title)
             _fill_field(page, "description", description)
@@ -124,159 +165,201 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
                 browser.close()
             except Exception:
                 pass
+  try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def _login(page, email: str, password: str) -> bool:
-    """メルカリにメール/パスワードでログインする"""
 
     def _log_state(label: str):
         try:
-            logger.info(f"[{label}] URL={page.url}")
-            # DOM上の全inputを取得（shadowDOMも含めてJSで調査）
+            url = page.url
             all_inputs = page.evaluate("""
                 () => {
                     const inputs = [];
                     document.querySelectorAll('input').forEach(el => {
-                        inputs.push({type: el.type, name: el.name, id: el.id,
-                                     placeholder: el.placeholder, visible: el.offsetParent !== null});
+                        inputs.push({
+                            type: el.type,
+                            name: el.name,
+                            id: el.id,
+                            placeholder: el.placeholder,
+                            visible: el.offsetParent !== null,
+                            autocomplete: el.autocomplete
+                        });
                     });
                     return inputs;
                 }
             """)
-            logger.info(f"[{label}] DOM inputs={all_inputs[:8]}")
-            btns = []
-            page.locator("button").all()
-            for b in page.locator("button").all()[:15]:
-                try:
-                    t = b.text_content()
-                    if t and t.strip():
-                        btns.append(t.strip())
-                except Exception:
-                    pass
-            logger.info(f"[{label}] buttons={btns}")
+            all_btns = page.evaluate("""
+                () => {
+                    const btns = [];
+                    document.querySelectorAll('button, [role="button"]').forEach(el => {
+                        if (el.offsetParent !== null) {
+                            btns.push(el.textContent.trim().substring(0, 30));
+                        }
+                    });
+                    return btns.filter(t => t.length > 0).slice(0, 20);
+                }
+            """)
+            logger.info(f"[{label}] URL: {url}")
+            logger.info(f"[{label}] inputs: {all_inputs}")
+            logger.info(f"[{label}] buttons: {all_btns}")
         except Exception as e:
-            logger.warning(f"[{label}] log error: {e}")
+            logger.warning(f"[{label}] ページ状態取得エラー: {e}")
 
     try:
-        logger.info("メルカリログイン開始")
-        page.goto("https://jp.mercari.com/login", wait_until="networkidle", timeout=40_000)
-        page.wait_for_timeout(3_000)
-        _log_state("初期")
+        logger.info("メルカリTOPページへアクセス...")
+        page.goto(
+            "https://jp.mercari.com",
+            wait_until="domcontentloaded",
+            timeout=40_000,
+        )
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+        _human_delay(2000, 3000)
+        _log_state("TOP")
 
-        # Step1: ナビの「ログイン」ボタンをクリック → login.jp.mercari.com に遷移
-        clicked_login = False
-        for btn in page.locator("button:has-text('ログイン'), a:has-text('ログイン')").all()[:5]:
+        logger.info("ナビのログインボタンを探す...")
+        login_nav_clicked = False
+
+        for sel in [
+            "a[href*='/login']",
+            "button:has-text('ログイン')",
+            "a:has-text('ログイン')",
+        ]:
             try:
-                if btn.is_visible(timeout=1_000):
-                    with page.expect_navigation(timeout=15_000):
-                        btn.click()
-                    page.wait_for_timeout(3_000)
-                    logger.info(f"ログインボタンクリック完了 → {page.url}")
-                    _log_state("ログインクリック後")
-                    clicked_login = True
+                els = page.locator(sel).all()
+                for el in els[:5]:
+                    try:
+                        if el.is_visible(timeout=1000):
+                            logger.info(f"ログインリンク発見: {sel}")
+                            try:
+                                with page.expect_navigation(timeout=15_000):
+                                    el.click()
+                                login_nav_clicked = True
+                            except Exception:
+                                el.click()
+                                _human_delay(3000, 5000)
+                                login_nav_clicked = True
+                            break
+                    except Exception:
+                        continue
+                if login_nav_clicked:
                     break
             except Exception:
-                # ナビゲーションなしでクリックだけ
+                continue
+
+        if not login_nav_clicked:
+            logger.warning("ナビからのクリック失敗、直接URLへ")
+            page.goto("https://jp.mercari.com/login", wait_until="domcontentloaded", timeout=30_000)
+
+        _human_delay(2000, 3000)
+        _log_state("ログインページ")
+
+        current_url = page.url
+        if "login.jp.mercari.com" not in current_url:
+            for sel in ["button:has-text('ログイン')", "a:has-text('ログイン')", "[href*='login']"]:
                 try:
-                    if btn.is_visible(timeout=500):
-                        btn.click()
-                        page.wait_for_timeout(4_000)
-                        logger.info(f"ログインボタンクリック（nav無し） → {page.url}")
-                        _log_state("ログインクリック後2")
-                        clicked_login = True
+                    btn = page.locator(sel).first
+                    if btn.is_visible(timeout=3000):
+                        logger.info(f"再試行: {sel} をクリック")
+                        try:
+                            with page.expect_navigation(timeout=15_000):
+                                btn.click()
+                        except Exception:
+                            btn.click()
+                            _human_delay(4000, 6000)
                         break
                 except Exception:
                     continue
 
-        # Step2: 「メールアドレスでログイン」を探す
+        _human_delay(2000, 3000)
+        _log_state("auth遷移後")
+
         for sel in [
             "button:has-text('メールアドレスでログイン')",
             "button:has-text('メールアドレス')",
-            "a:has-text('メールアドレスでログイン')",
             "[data-testid='email-login']",
+            "mer-button:has-text('メールアドレス')",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                btn.wait_for(state="visible", timeout=5_000)
+                btn.click()
+                logger.info(f"メールアドレスログインボタンクリック: {sel}")
+                _human_delay(1500, 2500)
+                break
+            except Exception:
+                continue
+
+        _log_state("メールボタン後")
+
+        logger.info("メールアドレス入力フィールドを待機中...")
+        email_css = (
+            "input[type='email'], input[name='email'], "
+            "input[autocomplete='email'], input[autocomplete='username'], "
+            "input[placeholder*='メール'], #email"
+        )
+        try:
+            page.wait_for_selector(email_css, state="visible", timeout=15_000)
+        except PWTimeout:
+            logger.error("メールアドレス入力欄が見つかりません（15秒待機後）")
+            _log_state("メール入力欄タイムアウト")
+            return False
+
+        email_el = page.locator(email_css).first
+        email_el.click()
+        _human_delay(300, 700)
+        email_el.fill(email)
+        logger.info("メールアドレス入力完了")
+        _human_delay(800, 1200)
+
+        for sel in [
+            "button:has-text('次へ')",
+            "button[type='submit']",
+            "input[type='submit']",
         ]:
             try:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=3_000):
                     btn.click()
-                    page.wait_for_timeout(3_000)
-                    logger.info(f"メールログインボタンクリック: {sel}")
-                    _log_state("メールボタン後")
+                    logger.info(f"次へボタンクリック: {sel}")
                     break
             except Exception:
                 continue
 
-        # Step3: メール入力欄が現れるまで待つ（最大15秒）
-        email_selector = "input[type='email'], input[name='email'], input[placeholder*='メール'], input[placeholder*='mail']"
+        _log_state("次へクリック直後")
+
+        logger.info("パスワード入力フィールドを待機中（最大20秒）...")
+        pw_css = (
+            "input[type='password'], input[name='password'], "
+            "input[autocomplete='current-password'], "
+            "input[placeholder*='パスワード'], #password"
+        )
         try:
-            page.wait_for_selector(email_selector, state="visible", timeout=15_000)
-            logger.info("メール入力欄が表示されました")
-        except PWTimeout:
-            _log_state("メール入力待ちタイムアウト")
-            logger.error("メール入力欄が15秒以内に表示されませんでした")
-            return False
-
-        # メール入力
-        email_filled = False
-        for sel in ["input[type='email']", "input[name='email']",
-                    "input[placeholder*='メール']", "input[placeholder*='mail']"]:
-            try:
-                el = page.locator(sel).first
-                if el.is_visible(timeout=2_000):
-                    el.click()
-                    el.fill(email)
-                    logger.info(f"メール入力完了: {sel}")
-                    email_filled = True
-                    break
-            except Exception:
-                continue
-
-        if not email_filled:
-            logger.error("メール入力に失敗")
-            return False
-
-        # Step4: 次へ
-        for sel in ["button:has-text('次へ')", "button[type='submit']"]:
-            try:
-                btn = page.locator(sel).first
-                if btn.is_visible(timeout=3_000):
-                    btn.click()
-                    logger.info(f"次へクリック: {sel}")
-                    break
-            except Exception:
-                continue
-
-        # Step5: パスワード入力欄が現れるまで待つ（最大15秒）
-        pw_selector = "input[type='password'], input[name='password'], input[placeholder*='パスワード']"
-        try:
-            page.wait_for_selector(pw_selector, state="visible", timeout=15_000)
+            page.wait_for_selector(pw_css, state="visible", timeout=20_000)
             logger.info("パスワード入力欄が表示されました")
         except PWTimeout:
-            _log_state("パスワード待ちタイムアウト")
-            logger.error("パスワード入力欄が15秒以内に表示されませんでした")
+            logger.error("パスワード入力欄が見つかりません（20秒待機後）")
+            _log_state("パスワード入力欄タイムアウト")
             return False
 
-        # パスワード入力
-        pw_filled = False
-        for sel in ["input[type='password']", "input[name='password']",
-                    "input[placeholder*='パスワード']", "input[autocomplete='current-password']"]:
-            try:
-                el = page.locator(sel).first
-                if el.is_visible(timeout=2_000):
-                    el.click()
-                    el.fill(password)
-                    logger.info(f"パスワード入力完了: {sel}")
-                    pw_filled = True
-                    break
-            except Exception:
-                continue
+        pw_el = page.locator(pw_css).first
+        pw_el.click()
+        _human_delay(300, 700)
+        pw_el.fill(password)
+        logger.info("パスワード入力完了")
+        _human_delay(500, 1000)
 
-        if not pw_filled:
-            logger.error("パスワード入力に失敗")
-            return False
-
-        # Step6: ログインボタン
-        for sel in ["button[type='submit']", "button:has-text('ログイン')", "button:has-text('サインイン')"]:
+        for sel in [
+            "button[type='submit']",
+            "button:has-text('ログイン')",
+            "button:has-text('サインイン')",
+        ]:
             try:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=3_000):
@@ -286,19 +369,22 @@ def _login(page, email: str, password: str) -> bool:
             except Exception:
                 continue
 
-        # ログイン完了待ち（最大20秒）
+        logger.info("ログイン完了を待機中...")
         try:
-            page.wait_for_url("**/jp.mercari.com/**", timeout=20_000)
-            logger.info(f"ログイン後URL: {page.url}")
-        except PWTimeout:
-            logger.info(f"URL待ちタイムアウト、現在URL: {page.url}")
+            page.wait_for_url("**/jp.mercari.com/**", timeout=25_000)
+        except Exception:
+            pass
+
+        _human_delay(3000, 5000)
 
         current_url = page.url
+        logger.info(f"ログイン後URL: {current_url}")
+
         if "login" in current_url.lower() or "signin" in current_url.lower():
-            _log_state("ログイン失敗")
-            logger.warning("ログイン後もlogin/signinページ")
+            _log_state("ログイン失敗確認")
             return False
 
+        logger.info("ログイン成功を確認")
         return True
 
     except Exception as e:
@@ -309,35 +395,57 @@ def _login(page, email: str, password: str) -> bool:
 def _fill_field(page, field_type: str, value: str):
     if not value:
         return
+
     selectors = {
-        "title": ["input[name='title']", "input[placeholder*='タイトル']", "input[placeholder*='商品名']"],
-        "description": ["textarea[name='description']", "textarea[placeholder*='説明']", "textarea[placeholder*='商品の説明']"],
+        "title": [
+            "input[name='title']",
+            "input[placeholder*='タイトル']",
+            "input[placeholder*='商品名']",
+            "[data-testid='title-input'] input",
+        ],
+        "description": [
+            "textarea[name='description']",
+            "textarea[placeholder*='説明']",
+            "textarea[placeholder*='商品の説明']",
+            "[data-testid='description-input'] textarea",
+        ],
     }
+
     for sel in selectors.get(field_type, []):
         try:
             el = page.locator(sel).first
             if el.is_visible(timeout=3_000):
                 el.click()
                 el.fill(value)
-                logger.info(f"{field_type} 入力完了")
+                logger.info(f"{field_type} ({sel}) に入力完了")
                 return
         except Exception:
             continue
+
     logger.warning(f"{field_type} フィールドが見つかりませんでした")
 
 
 def _fill_price(page, price: str):
     price_digits = "".join(filter(str.isdigit, price)) or "1000"
-    for sel in ["input[name='price']", "input[placeholder*='価格']", "input[placeholder*='販売価格']", "input[type='number']"]:
+
+    for sel in [
+        "input[name='price']",
+        "input[placeholder*='価格']",
+        "input[placeholder*='販売価格']",
+        "[data-testid='price-input'] input",
+        "input[type='number']",
+    ]:
         try:
             el = page.locator(sel).first
             if el.is_visible(timeout=3_000):
                 el.click()
                 el.fill(price_digits)
-                logger.info(f"価格入力: {price_digits}")
+                logger.info(f"価格フィールド ({sel}) に {price_digits} を入力")
                 return
         except Exception:
             continue
+
+    logger.warning("価格フィールドが見つかりませんでした")
 
 
 def _select_condition(page, condition: str):
@@ -348,19 +456,20 @@ def _select_condition(page, condition: str):
         "普通":  ["やや傷や汚れあり"],
         "悪い":  ["傷や汚れあり", "全体的に状態が悪い"],
     }
+
     try:
         cond_btn = page.locator("button:has-text('商品の状態'), [data-testid='condition']").first
         if cond_btn.is_visible(timeout=3_000):
             cond_btn.click()
-            page.wait_for_timeout(1_000)
+            _human_delay(800, 1200)
             for label in condition_map.get(condition, [condition]):
                 btn = page.locator(f"text='{label}'").first
                 if btn.is_visible(timeout=2_000):
                     btn.click()
-                    logger.info(f"商品状態: {label}")
+                    logger.info(f"商品状態: {label} を選択")
                     return
     except Exception as e:
-        logger.warning(f"状態選択エラー: {e}")
+        logger.warning(f"状態選択エラー（スキップ）: {e}")
 
 
 def _click_draft_button(page) -> bool:
@@ -369,23 +478,26 @@ def _click_draft_button(page) -> bool:
             btn = page.locator(f"button:has-text('{text}')").first
             if btn.is_visible(timeout=3_000):
                 btn.click()
-                logger.info(f"下書きボタン「{text}」クリック")
-                page.wait_for_timeout(3_000)
+                logger.info(f"下書きボタン「{text}」をクリック")
+                _human_delay(2000, 3000)
                 return True
         except Exception:
             continue
+
     try:
         btn = page.locator("[aria-label*='下書き'], [aria-label*='draft']").first
         if btn.is_visible(timeout=3_000):
             btn.click()
-            page.wait_for_timeout(2_000)
+            _human_delay(2000, 3000)
             return True
     except Exception:
         pass
+
     logger.error("下書き保存ボタンが見つかりませんでした")
     try:
         btns = [b.text_content() for b in page.locator("button").all()[:20] if b.is_visible()]
         logger.info(f"ページ上のボタン: {btns}")
     except Exception:
         pass
+
     return False
