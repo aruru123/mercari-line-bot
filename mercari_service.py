@@ -51,7 +51,7 @@ def create_mercari_draft(
     try:
         saved = _run_playwright(product_info, email, password, tmp_paths)
     except Exception as e:
-        logger.error(f"Playwright 実行中に予期しないエラー: {e}\n{traceback.format_exc()}")
+        logger.error f"Playwright 実行中に予期しないエラー: {e}\n{traceback.format_exc()}")
     finally:
         for p in tmp_paths:
             try:
@@ -73,7 +73,7 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
+                "--disable-blink-features=AutomationController",
                 "--disable-web-security",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--lang=ja-JP",
@@ -107,7 +107,7 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
                 stealth_sync(page)
                 logger.info("playwright-stealth適用済み")
             else:
-                logger.warning("playwright-stealth未インストール（bot検知リスクあり）")
+                logger.warning("playwright-stealth未インストール（bot検知リスクあり���")
 
             if not _login(page, email, password):
                 logger.error("ログインに失敗しました")
@@ -122,7 +122,7 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
                 )
                 page.wait_for_load_state("networkidle", timeout=20_000)
             except PWTimeout:
-                logger.error("タイムアウト: 出品ページの読み込みに失敗")
+                logger.error("タイムアギト: 出品ページの読み込みに失敗")
                 return False
 
             _human_delay(2000, 4000)
@@ -162,10 +162,6 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             return False
         finally:
             try:
-                browser.close()
-            except Exception:
-                pass
-  try:
                 browser.close()
             except Exception:
                 pass
