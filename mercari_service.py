@@ -20,18 +20,6 @@ def create_mercari_draft(
     images_bytes: list | None = None,
     cookies_json: str | None = None,
 ) -> bool:
-    """
-    メルカリに商品の下書きを作成する。
-    メール/パスワードでログイン → 下書き保存。
-
-    Args:
-        product_info:  Gemini が返す商品情報 dict
-        images_bytes:  商品画像のバイト列リスト（複数枚対応）
-        cookies_json:  使用しない（後方互換のため残す）
-
-    Returns:
-        True = 下書き保存成功 / False = 失敗
-    """
     if isinstance(images_bytes, bytes):
         images_bytes = [images_bytes]
     if images_bytes is None:
@@ -44,7 +32,6 @@ def create_mercari_draft(
         logger.error("MERCARI_EMAIL または MERCARI_PASSWORD が設定されていません")
         return False
 
-    # 全画像を一時ファイルに保存
     tmp_paths = []
     for i, img_bytes in enumerate(images_bytes):
         try:
@@ -70,12 +57,7 @@ def create_mercari_draft(
     return saved
 
 
-# ---------------------------------------------------------------------------
-# 内部関数
-# ---------------------------------------------------------------------------
-
 def _run_playwright(product_info: dict, email: str, password: str, image_paths: list) -> bool:
-    """Playwright を使ってメルカリにログインし、下書きを作成する"""
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -98,14 +80,12 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
         try:
             page = context.new_page()
 
-            # ---- ログイン ----
             if not _login(page, email, password):
                 logger.error("ログインに失敗しました")
                 return False
 
             logger.info("ログイン成功")
 
-            # ---- 出品ページへ移動 ----
             logger.info("出品ページへ移動中...")
             try:
                 page.goto(
@@ -120,7 +100,6 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             page.wait_for_timeout(3_000)
             logger.info(f"出品ページURL: {page.url}")
 
-            # ---- 画像アップロード ----
             if image_paths:
                 logger.info(f"{len(image_paths)}枚の画像をアップロード中...")
                 try:
@@ -133,7 +112,6 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
                 except Exception as e:
                     logger.warning(f"画像アップロードエラー（続行）: {e}")
 
-            # ---- 各フィールド入力 ----
             title       = product_info.get("name", "商品")
             description = product_info.get("description", "")
             price       = str(product_info.get("price", 1000))
@@ -147,7 +125,6 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             if condition:
                 _select_condition(page, condition)
 
-            # ---- 下書き保存 ----
             saved = _click_draft_button(page)
             logger.info(f"下書き保存結果: {'成功' if saved else '失敗'}")
             return saved
@@ -165,15 +142,13 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
 def _login(page, email: str, password: str) -> bool:
     """メルカリにメール/パスワードでログインする"""
     def _log_page_state(label: str):
-        """デバッグ用: ページの状態をログに記録"""
         try:
             logger.info(f"[{label}] URL: {page.url}")
-            logger.info(f"[{label}] タイトル: {page.title()}")
             inputs = page.locator("input").all()
             input_info = []
-            for i in inputs[:15]:
+            for i in inputs[:10]:
                 try:
-                    if i.is_visible(timeout=500):
+                    if i.is_visible(timeout=300):
                         input_info.append({
                             "type": i.get_attribute("type"),
                             "name": i.get_attribute("name"),
@@ -182,18 +157,20 @@ def _login(page, email: str, password: str) -> bool:
                         })
                 except Exception:
                     pass
-            logger.info(f"[{label}] input要素: {input_info}")
+            logger.info(f"[{label}] inputs: {input_info}")
             buttons = page.locator("button").all()
             btn_texts = []
-            for b in buttons[:20]:
+            for b in buttons[:15]:
                 try:
-                    if b.is_visible(timeout=500):
-                        btn_texts.append(b.text_content())
+                    if b.is_visible(timeout=300):
+                        t = b.text_content()
+                        if t and t.strip():
+                            btn_texts.append(t.strip())
                 except Exception:
                     pass
-            logger.info(f"[{label}] ボタン: {btn_texts}")
+            logger.info(f"[{label}] buttons: {btn_texts}")
         except Exception as e:
-            logger.warning(f"[{label}] ページ状態取得エラー: {e}")
+            logger.warning(f"[{label}] state error: {e}")
 
     try:
         logger.info("ログインページへアクセス中...")
@@ -203,31 +180,46 @@ def _login(page, email: str, password: str) -> bool:
             timeout=40_000,
         )
         page.wait_for_timeout(3_000)
-        _log_page_state("ログインページ初期")
+        _log_page_state("初期")
 
-        # メールアドレスでログインボタンを探す（より多くのセレクタ）
+        # ★ Step 1: ナビの「ログイン」ボタンをクリックしてモーダルを開く
+        # （/login はホーム画面が表示されるためモーダル起動が必要）
+        try:
+            nav_btns = page.locator("button:has-text('ログイン'), a:has-text('ログイン')").all()
+            for btn in nav_btns[:5]:
+                try:
+                    if btn.is_visible(timeout=1_000):
+                        btn.click()
+                        page.wait_for_timeout(3_000)
+                        logger.info("ナビのログインボタンをクリック（モーダル起動）")
+                        _log_page_state("モーダル起動後")
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"ナビログインボタンエラー: {e}")
+
+        # ★ Step 2: 「メールアドレスでログイン」を探してクリック
         email_login_selectors = [
             "button:has-text('メールアドレスでログイン')",
             "button:has-text('メールアドレス')",
             "a:has-text('メールアドレスでログイン')",
             "[data-testid='email-login']",
-            "button:has-text('Email')",
-            "button:has-text('email')",
             "mer-button:has-text('メールアドレス')",
         ]
         for sel in email_login_selectors:
             try:
                 btn = page.locator(sel).first
-                if btn.is_visible(timeout=2_000):
+                if btn.is_visible(timeout=3_000):
                     btn.click()
                     page.wait_for_timeout(3_000)
                     logger.info(f"メールログインボタンをクリック: {sel}")
-                    _log_page_state("メールボタンクリック後")
+                    _log_page_state("メールボタン後")
                     break
             except Exception:
                 continue
 
-        # メールアドレス入力（より多くのセレクタ）
+        # ★ Step 3: メールアドレス入力
         email_selectors = [
             "input[type='email']",
             "input[name='email']",
@@ -237,7 +229,6 @@ def _login(page, email: str, password: str) -> bool:
             "input[autocomplete='email']",
             "input[autocomplete='username']",
             "#email",
-            "#username",
         ]
         email_filled = False
         for sel in email_selectors:
@@ -253,32 +244,25 @@ def _login(page, email: str, password: str) -> bool:
                 continue
 
         if not email_filled:
-            _log_page_state("メール入力欄不明")
+            _log_page_state("メール入力欄なし")
             logger.error("メールアドレス入力欄が見つかりません")
             return False
 
-        # 次へボタン or パスワード入力が直接ある場合
-        next_selectors = [
-            "button:has-text('次へ')",
-            "button[type='submit']",
-            "button:has-text('ログイン')",
-            "button:has-text('Continue')",
-            "button:has-text('続ける')",
-        ]
-        for sel in next_selectors:
+        # ★ Step 4: 「次へ」ボタン
+        for sel in ["button:has-text('次へ')", "button[type='submit']"]:
             try:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=2_000):
                     btn.click()
                     page.wait_for_timeout(3_000)
-                    logger.info(f"次へボタンをクリック: {sel}")
+                    logger.info(f"次へボタンクリック: {sel}")
                     break
             except Exception:
                 continue
 
-        _log_page_state("次へボタンクリック後")
+        _log_page_state("次へ後")
 
-        # パスワード入力
+        # ★ Step 5: パスワード入力
         pw_selectors = [
             "input[type='password']",
             "input[name='password']",
@@ -300,41 +284,28 @@ def _login(page, email: str, password: str) -> bool:
                 continue
 
         if not pw_filled:
-            _log_page_state("パスワード入力欄不明")
+            _log_page_state("パスワード入力欄なし")
             logger.error("パスワード入力欄が見つかりません")
             return False
 
-        # ログインボタンをクリック
-        login_selectors = [
-            "button[type='submit']",
-            "button:has-text('ログイン')",
-            "button:has-text('サインイン')",
-            "button:has-text('Sign in')",
-        ]
-        for sel in login_selectors:
+        # ★ Step 6: ログインボタン
+        for sel in ["button[type='submit']", "button:has-text('ログイン')", "button:has-text('サインイン')"]:
             try:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=3_000):
                     btn.click()
-                    logger.info(f"ログインボタンをクリック: {sel}")
+                    logger.info(f"ログインボタンクリック: {sel}")
                     break
             except Exception:
                 continue
 
-        # ログイン完了を待つ
         page.wait_for_timeout(6_000)
-
         current_url = page.url
         logger.info(f"ログイン後URL: {current_url}")
 
-        # ログイン成功確認
         if "login" in current_url.lower() or "signin" in current_url.lower():
             _log_page_state("ログイン失敗後")
-            error_el = page.locator("text='パスワードが違います', text='メールアドレスが違います', text='ログインできません'").first
-            if error_el.is_visible(timeout=2_000):
-                logger.error("ログインエラー: 認証情報が正しくありません")
-                return False
-            logger.warning("ログイン後もlogin URLです。2段階認証が必要な可能性があります")
+            logger.warning("ログイン後もlogin URLです")
             return False
 
         return True
@@ -345,10 +316,8 @@ def _login(page, email: str, password: str) -> bool:
 
 
 def _fill_field(page, field_type: str, value: str):
-    """テキストフィールドを埋める"""
     if not value:
         return
-
     selectors = {
         "title": [
             "input[name='title']",
@@ -363,7 +332,6 @@ def _fill_field(page, field_type: str, value: str):
             "[data-testid='description-input'] textarea",
         ],
     }
-
     for sel in selectors.get(field_type, []):
         try:
             el = page.locator(sel).first
@@ -374,14 +342,11 @@ def _fill_field(page, field_type: str, value: str):
                 return
         except Exception:
             continue
-
     logger.warning(f"{field_type} フィールドが見つかりませんでした")
 
 
 def _fill_price(page, price: str):
-    """価格フィールドを埋める（数字のみ）"""
     price_digits = "".join(filter(str.isdigit, price)) or "1000"
-
     selectors = [
         "input[name='price']",
         "input[placeholder*='価格']",
@@ -399,12 +364,10 @@ def _fill_price(page, price: str):
                 return
         except Exception:
             continue
-
     logger.warning("価格フィールドが見つかりませんでした")
 
 
 def _select_condition(page, condition: str):
-    """商品の状態を選択する"""
     condition_map = {
         "新品":  ["新品、未使用", "新品未使用"],
         "未使用": ["新品、未使用", "新品未使用", "未使用に近い"],
@@ -412,7 +375,6 @@ def _select_condition(page, condition: str):
         "普通":  ["やや傷や汚れあり"],
         "悪い":  ["傷や汚れあり", "全体的に状態が悪い"],
     }
-
     try:
         cond_btn = page.locator("button:has-text('商品の状態'), [data-testid='condition']").first
         if cond_btn.is_visible(timeout=3_000):
@@ -430,17 +392,7 @@ def _select_condition(page, condition: str):
 
 
 def _click_draft_button(page) -> bool:
-    """下書き保存ボタンをクリックする"""
-    draft_texts = [
-        "下書き保存",
-        "下書きとして保存",
-        "下書き",
-        "一時保存",
-        "保存する",
-        "draft",
-        "save as draft",
-    ]
-
+    draft_texts = ["下書き保存", "下書きとして保存", "下書き", "一時保存", "保存する", "draft", "save as draft"]
     for text in draft_texts:
         try:
             btn = page.locator(f"button:has-text('{text}')").first
@@ -448,20 +400,16 @@ def _click_draft_button(page) -> bool:
                 btn.click()
                 logger.info(f"下書きボタン「{text}」をクリック")
                 page.wait_for_timeout(3_000)
-
                 new_url = page.url
                 logger.info(f"クリック後のURL: {new_url}")
                 if "draft" in new_url or "mypage" in new_url or "complete" in new_url:
                     return True
-
                 toast = page.locator("text='保存しました', text='下書きに保存'").first
                 if toast.is_visible(timeout=3_000):
                     return True
-
                 return True
         except Exception:
             continue
-
     try:
         btn = page.locator("[aria-label*='下書き'], [aria-label*='draft']").first
         if btn.is_visible(timeout=3_000):
@@ -470,7 +418,6 @@ def _click_draft_button(page) -> bool:
             return True
     except Exception:
         pass
-
     logger.error("下書き保存ボタンが見つかりませんでした")
     try:
         buttons = page.locator("button").all()
@@ -478,5 +425,4 @@ def _click_draft_button(page) -> bool:
         logger.info(f"ページ上のボタン: {btn_texts}")
     except Exception:
         pass
-
     return False
