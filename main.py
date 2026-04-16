@@ -128,12 +128,14 @@ def process_images(images: list, user_id: str):
 
     try:
         n = len(images)
-        logger.info(f"Gemini解析開始: {n}枚")
-        product_info = analyze_product_images(images, GEMINI_API_KEY)
-
-        if not product_info:
-            push_message(user_id, "❌ 商品情報の解析に失敗しました")
-            return
+        logger.info(f"固定テストデータ使用: {n}枚")
+        # Gemini無効化 - 固定データでテスト
+        product_info = {
+            "name": "テスト商品",
+            "price": 1000,
+            "description": "テストです",
+            "condition": "目立った傷や汚れなし",
+        }
 
         name  = product_info.get("name", "商品")
         price = product_info.get("price", 0)
