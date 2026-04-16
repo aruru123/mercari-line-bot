@@ -73,9 +73,9 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
+                "--disable-blink-features=AutomationControlled,CredentialManagement",
                 "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-features=IsolateOrigins,site-per-process,WebAuthentication",
                 "--lang=ja-JP",
             ],
         )
@@ -98,6 +98,17 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en-US', 'en'] });
             window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+            // WebAuthn/Passkey を無効化 → メルカリがパスワードログインにフォールバック
+            try {
+                const _creds = {
+                    get: () => Promise.reject(new DOMException('Operation not allowed', 'NotAllowedError')),
+                    create: () => Promise.reject(new DOMException('Operation not allowed', 'NotAllowedError')),
+                    preventSilentAccess: () => Promise.resolve(),
+                    store: () => Promise.resolve(),
+                };
+                Object.defineProperty(navigator, 'credentials', { get: () => _creds });
+                window.PublicKeyCredential = undefined;
+            } catch(e) {}
         """)
 
         try:
@@ -331,7 +342,7 @@ def _login(page, email: str, password: str) -> bool:
         _log_state("次へクリック直後")
         _human_delay(2000, 3000)
 
-        # パスキー画面が表示された場合、「他の方でログイン」ボタンを探してクリック（第1段階）
+        # パスキー画面が表示された場合、「他の方法」ボタンを探してクリック（第1段階）
         passkey_bypass_selectors = [
             "button:has-text('他の方でログインする')",
             "button:has-text('パスワードでログイン')",
@@ -367,7 +378,7 @@ def _login(page, email: str, password: str) -> bool:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=4_000):
                     btn.click()
-                    logger.info(f"パスワードログインボタンクリッ���（第2段階）: {sel}")
+                    logger.info(f"パスワードログインボタンクリック（第2段階）: {sel}")
                     _human_delay(1500, 2500)
                     break
             except Exception:
@@ -403,7 +414,7 @@ def _login(page, email: str, password: str) -> bool:
                 btn = page.locator(sel).first
                 if btn.is_visible(timeout=3_000):
                     btn.click()
-                    logger.info(f"ログインボタンクリッ���: {sel}")
+                    logger.info(f"ログインボタンクリック: {sel}")
                     break
             except Exception:
                 continue
@@ -516,8 +527,7 @@ def _click_draft_button(page) -> bool:
         try:
             btn = page.locator(f"button:has-text('{text}')").first
             if btn.is_visible(timeout=3_000):
-                btn.click()
-                logger.info(f"下書きボタン「{text}」をクリック")
+                btn.click()       logger.info(f"下書きボタン「{text}」をクリック")
                 _human_delay(2000, 3000)
                 return True
         except Exception:
