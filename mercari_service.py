@@ -144,18 +144,51 @@ def _login(page, email: str, password: str) -> bool:
     except Exception:
         logger.warning("networkidle タイムアウト - 続行")
 
+    _human_delay(2000, 3000)
     logger.info("ログインページ URL: %s", page.url)
     logger.info("ログインページ タイトル: %s", page.title())
     _screenshot_b64(page, "login_page")
 
-    # ── メールアドレス入力 ──────────────────────────
+    # ── ① 「メールアドレスでログイン」ボタンを先にクリック ──
+    # メルカリのログインページは最初に選択肢（電話/メール）が表示される
+    email_btn_selectors = [
+        "button:has-text('メールアドレス')",
+        "button:has-text('メールアドレスでログイン')",
+        "a:has-text('メールアドレスでログイン')",
+        "button:has-text('メールでログイン')",
+        "a:has-text('メールでログイン')",
+        "[data-testid*='email']",
+        "button:has-text('Email')",
+        "button:has-text('メール')",
+    ]
+    for sel in email_btn_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=3000):
+                btn.click()
+                logger.info("✅ メールログインボタンクリック: %s", sel)
+                _human_delay(2000, 3000)
+                _screenshot_b64(page, "after_email_btn")
+                break
+        except Exception as exc:
+            logger.info("メールボタンセレクタ: %s → %s", sel, exc)
+
+    # ── ② メールアドレス入力 ──────────────────────────
     email_selectors = [
         "input[type='email']",
         "input[name='email']",
+        "input[type='tel']",
+        "input[name='phone']",
         "input[placeholder*='メール']",
+        "input[placeholder*='電話']",
         "input[placeholder*='mail']",
         "input[placeholder*='Email']",
+        "input[placeholder*='Phone']",
         "input[autocomplete='email']",
+        "input[autocomplete='tel']",
+        "input[autocomplete='username']",
+        "form input[type='text']",
+        "input[type='text']:not([placeholder*='お探し'])",
     ]
     email_filled = False
     for sel in email_selectors:
