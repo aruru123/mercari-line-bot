@@ -73,7 +73,7 @@ def _run_playwright(product_info: dict, email: str, password: str, image_paths: 
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationController",
+                "--disable-blink-features=AutomationControlled",
                 "--disable-web-security",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--lang=ja-JP",
@@ -250,7 +250,7 @@ def _login(page, email: str, password: str) -> bool:
                 continue
 
         if not login_nav_clicked:
-            logger.warning("ナビからのクリック失敗、直接URLへ")
+            logger.warning("ナビからはクリック失敗、直接URLへ")
             page.goto("https://jp.mercari.com/login", wait_until="domcontentloaded", timeout=30_000)
 
         _human_delay(2000, 3000)
@@ -303,7 +303,7 @@ def _login(page, email: str, password: str) -> bool:
         try:
             page.wait_for_selector(email_css, state="visible", timeout=15_000)
         except PWTimeout:
-            logger.error("メールアドレス入力欄が見つかりません（15秒待機後）")
+            logger.error("メールアドレス入力欄が見つかりませゑ（15秒待機後）")
             _log_state("メール入力欄タイムアウト")
             return False
 
@@ -329,18 +329,39 @@ def _login(page, email: str, password: str) -> bool:
                 continue
 
         _log_state("次へクリック直後")
+        _human_delay(2000, 3000)
 
-        logger.info("パスワード入力フィールドを待機中（最大20秒）...")
+        # パスキー画面が表示された場合、「別の方法」or「パスワードでログイン」を探してクリック
+        passkey_bypass_selectors = [
+            "button:has-text('パスワードでログイン')",
+            "button:has-text('別の方法')",
+            "a:has-text('パスワードでログイン')",
+            "a:has-text('別の方法')",
+            "[data-testid='use-password']",
+            "button:has-text('Use a password')",
+        ]
+        for sel in passkey_bypass_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=3_000):
+                    btn.click()
+                    logger.info(f"パスキー回避ボタンクリック: {sel}")
+                    _human_delay(1500, 2500)
+                    break
+            except Exception:
+                continue
+
+        logger.info("パスワード入力フィールドを待機中（最大25秒）...")
         pw_css = (
             "input[type='password'], input[name='password'], "
             "input[autocomplete='current-password'], "
             "input[placeholder*='パスワード'], #password"
         )
         try:
-            page.wait_for_selector(pw_css, state="visible", timeout=20_000)
+            page.wait_for_selector(pw_css, state="visible", timeout=25_000)
             logger.info("パスワード入力欄が表示されました")
         except PWTimeout:
-            logger.error("パスワード入力欄が見つかりません（20秒待機後）")
+            logger.error("パスワード入力欄が見つかりません（25秒待機後）")
             _log_state("パスワード入力欄タイムアウト")
             return False
 
