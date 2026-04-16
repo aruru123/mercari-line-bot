@@ -2,6 +2,8 @@ import logging
 import traceback
 import time
 import random
+import base64
+import os
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
@@ -12,19 +14,33 @@ def _human_delay(min_ms: int = 500, max_ms: int = 1500):
     time.sleep(random.randint(min_ms, max_ms) / 1000)
 
 
+def _screenshot_b64(page, label: str):
+    """スクリーンショットをbase64でログに出力（デバッグ用）"""
+    try:
+        path = f"/tmp/mercari_{label}.png"
+        page.screenshot(path=path)
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        logger.info("[SCREENSHOT:%s] data:image/png;base64,%s", label, b64[:100] + "...")
+        logger.info("[SCREENSHOT_PATH:%s] %s (size=%d bytes)", label, path, len(b64))
+    except Exception as e:
+        logger.warning("スクリーンショット失敗: %s", e)
+
+
 def create_mercari_draft(
     product_info: dict,
     images_bytes: list | None = None,
     cookies_json: str | None = None,
 ) -> bool:
     """メルカリにログインして下書き保存する"""
-    import os
     email = os.environ.get("MERCARI_EMAIL", "")
     password = os.environ.get("MERCARI_PASSWORD", "")
 
     if not email or not password:
         logger.error("MERCARI_EMAIL または MERCARI_PASSWORD が未設定")
         return False
+
+    logger.info("メール設定確認: %s", email[:3] + "***")
 
     try:
         with sync_playwright() as p:
@@ -70,14 +86,19 @@ def create_mercari_draft(
 
             try:
                 if not _login(page, email, password):
-                    logger.error("ログイン失敗")
+                    logger.error("ログイン失敗 - 処理中断")
+                    _screenshot_b64(page, "login_fail")
                     return False
 
-                logger.info("出品ページへ移動...")
+                logger.info("ログイン成功 - 出品ページへ移動...")
                 page.goto("https://jp.mercari.com/sell/photos", timeout=60000)
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
                 _human_delay(2000, 3000)
-                logger.info("出品ページURL: %s", page.url)
+                logger.info("出品ページ URL: %s / タイトル: %s", page.url, page.title())
+                _screenshot_b64(page, "sell_page")
 
                 title = product_info.get("name", product_info.get("title", "テスト商品"))
                 price = str(product_info.get("price", 1000))
@@ -90,19 +111,16 @@ def create_mercari_draft(
                 ])
 
                 _fill_price(page, price)
+                _screenshot_b64(page, "before_draft")
 
                 saved = _click_draft_button(page)
-                logger.info("下書き保存: %s", "成功" if saved else "失敗")
+                logger.info("下書き保存結果: %s", "成功" if saved else "失敗")
+                _screenshot_b64(page, "after_draft")
 
             except Exception as e:
                 logger.error("操作エラー: %s\n%s", e, traceback.format_exc())
                 saved = False
             finally:
-                try:
-                    page.screenshot(path="/tmp/mercari_debug.png")
-                    logger.info("スクリーンショット保存完了")
-                except Exception:
-                    pass
                 try:
                     browser.close()
                 except Exception:
@@ -116,98 +134,188 @@ def create_mercari_draft(
 
 
 def _login(page, email: str, password: str) -> bool:
-    """メルカリにメール+パスワードでログイン"""
-    logger.info("ログインページへ移動...")
+    """メルカリにログイン（詳細ログ付き）"""
+    logger.info("=== ログイン開始 ===")
     page.goto("https://jp.mercari.com/login", timeout=60000)
-    page.wait_for_load_state("domcontentloaded", timeout=30000)
-    _human_delay(2000, 3000)
 
-    for sel in ["input[type='email']", "input[name='email']", "input[placeholder*='メール']"]:
+    # networkidle まで待機（React SPAのレンダリング完了を待つ）
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        logger.warning("networkidle タイムアウト - 続行")
+
+    logger.info("ログインページ URL: %s", page.url)
+    logger.info("ログインページ タイトル: %s", page.title())
+    _screenshot_b64(page, "login_page")
+
+    # ── メールアドレス入力 ──────────────────────────
+    email_selectors = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[placeholder*='メール']",
+        "input[placeholder*='mail']",
+        "input[placeholder*='Email']",
+        "input[autocomplete='email']",
+    ]
+    email_filled = False
+    for sel in email_selectors:
         try:
             el = page.locator(sel).first
-            if el.is_visible(timeout=5000):
+            visible = el.is_visible(timeout=5000)
+            logger.info("メールセレクタ確認: %s → visible=%s", sel, visible)
+            if visible:
                 el.click()
                 el.fill(email)
-                logger.info("メール入力完了")
+                logger.info("✅ メール入力完了: %s", sel)
+                email_filled = True
                 break
-        except Exception:
-            continue
+        except Exception as exc:
+            logger.info("メールセレクタ例外: %s → %s", sel, exc)
+
+    if not email_filled:
+        logger.warning("❌ メールフィールドが見つかりません - ページHTML確認")
+        # ページの全inputを記録
+        inputs = page.locator("input").all()
+        logger.info("input要素数: %d", len(inputs))
+        for i, inp in enumerate(inputs[:10]):
+            try:
+                attrs = {
+                    "type": inp.get_attribute("type"),
+                    "name": inp.get_attribute("name"),
+                    "placeholder": inp.get_attribute("placeholder"),
+                    "id": inp.get_attribute("id"),
+                }
+                logger.info("input[%d]: %s", i, attrs)
+            except Exception:
+                pass
+        return False
 
     _human_delay(500, 1000)
 
-    for sel in ["button:has-text('次へ')", "button:has-text('続ける')", "button[type='submit']"]:
+    # ── 次へボタン ──────────────────────────────────
+    next_selectors = [
+        "button:has-text('次へ')",
+        "button:has-text('続ける')",
+        "button:has-text('Next')",
+        "button[type='submit']",
+        "button:has-text('ログイン')",
+    ]
+    next_clicked = False
+    for sel in next_selectors:
         try:
             btn = page.locator(sel).first
-            if btn.is_visible(timeout=3000):
+            visible = btn.is_visible(timeout=3000)
+            logger.info("次へセレクタ: %s → visible=%s", sel, visible)
+            if visible:
                 btn.click()
-                logger.info("次へボタンクリック: %s", sel)
+                logger.info("✅ 次へボタンクリック: %s", sel)
+                next_clicked = True
                 break
-        except Exception:
-            continue
+        except Exception as exc:
+            logger.info("次へセレクタ例外: %s → %s", sel, exc)
+
+    if not next_clicked:
+        logger.warning("❌ 次へボタンが見つかりません")
 
     _human_delay(2000, 3000)
+    logger.info("次へ後 URL: %s", page.url)
+    _screenshot_b64(page, "after_next")
 
-    for sel in [
+    # ── パスキーバイパス（第1段階） ──────────────────
+    passkey_selectors = [
         "button:has-text('他の方でログインする')",
         "button:has-text('パスワードでログイン')",
         "button:has-text('別の方法')",
         "button:has-text('他の方法')",
         "a:has-text('パスワードでログイン')",
-    ]:
-        try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=3000):
-                btn.click()
-                logger.info("パスキーバイパス(1): %s", sel)
-                _human_delay(1000, 2000)
-                break
-        except Exception:
-            continue
-
-    for sel in [
-        "button:has-text('パスワードでログイン')",
-        "a:has-text('パスワードでログイン')",
-        "button:has-text('パスワード')",
-        "[data-testid='use-password']",
-    ]:
+        "button:has-text('Use a password')",
+        "button:has-text('Try another way')",
+    ]
+    for sel in passkey_selectors:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=2000):
                 btn.click()
-                logger.info("パスキーバイパス(2): %s", sel)
+                logger.info("✅ パスキーバイパス(1): %s", sel)
                 _human_delay(1000, 2000)
                 break
         except Exception:
-            continue
+            pass
 
-    for sel in ["input[type='password']", "input[name='password']", "input[placeholder*='パスワード']"]:
+    # ── パスキーバイパス（第2段階） ──────────────────
+    pw_login_selectors = [
+        "button:has-text('パスワードでログイン')",
+        "a:has-text('パスワードでログイン')",
+        "button:has-text('パスワード')",
+        "[data-testid='use-password']",
+    ]
+    for sel in pw_login_selectors:
         try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=5000):
-                el.click()
-                el.fill(password)
-                logger.info("パスワード入力完了")
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                logger.info("✅ パスキーバイパス(2): %s", sel)
+                _human_delay(1000, 2000)
                 break
         except Exception:
-            continue
+            pass
+
+    logger.info("パスキーバイパス後 URL: %s", page.url)
+    _screenshot_b64(page, "after_passkey")
+
+    # ── パスワード入力 ────────────────────────────────
+    pw_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[placeholder*='パスワード']",
+        "input[autocomplete='current-password']",
+    ]
+    pw_filled = False
+    for sel in pw_selectors:
+        try:
+            el = page.locator(sel).first
+            visible = el.is_visible(timeout=5000)
+            logger.info("パスワードセレクタ: %s → visible=%s", sel, visible)
+            if visible:
+                el.click()
+                el.fill(password)
+                logger.info("✅ パスワード入力完了: %s", sel)
+                pw_filled = True
+                break
+        except Exception as exc:
+            logger.info("パスワードセレクタ例外: %s → %s", sel, exc)
+
+    if not pw_filled:
+        logger.warning("❌ パスワードフィールドが見つかりません")
+        return False
 
     _human_delay(500, 1000)
 
-    for sel in ["button:has-text('ログイン')", "button[type='submit']"]:
+    # ── ログインボタン ────────────────────────────────
+    login_btn_selectors = [
+        "button:has-text('ログイン')",
+        "button[type='submit']",
+        "button:has-text('Sign in')",
+    ]
+    for sel in login_btn_selectors:
         try:
             btn = page.locator(sel).first
             if btn.is_visible(timeout=3000):
                 btn.click()
-                logger.info("ログインボタンクリック")
+                logger.info("✅ ログインボタンクリック: %s", sel)
                 break
         except Exception:
-            continue
+            pass
 
-    _human_delay(3000, 5000)
+    # ログイン処理を待つ
+    _human_delay(4000, 6000)
+
     current_url = page.url
-    logger.info("ログイン後URL: %s", current_url)
+    logger.info("=== ログイン結果 URL: %s ===", current_url)
+    _screenshot_b64(page, "login_result")
+
     logged_in = "login" not in current_url
-    logger.info("ログイン結果: %s", "成功" if logged_in else "失敗")
+    logger.info("ログイン: %s", "✅ 成功" if logged_in else "❌ 失敗（まだloginページ）")
     return logged_in
 
 
@@ -218,7 +326,7 @@ def _fill_field(page, text: str, selectors: list) -> bool:
             if el.is_visible(timeout=3000):
                 el.click()
                 el.fill(text)
-                logger.info("フィールド入力: %s -> %s", sel, text[:30])
+                logger.info("フィールド入力: %s → %s", sel, text[:30])
                 _human_delay(300, 700)
                 return True
         except Exception:
